@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,14 +11,26 @@ import (
 	"log"
 	"net/http"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 )
 
 type Config struct {
-	Addr  string `json:"addr"`
-	Root  string `json:"root"`
-	Token string `json:"token"`
+	Addr       string `json:"addr"`
+	Root       string `json:"root"`
+	Token      string `json:"token"`
+	IgnoreFile string `json:"ignore_file"`
+}
+
+type IgnoreMatcher struct {
+	rules []IgnoreRule
+}
+
+type IgnoreRule struct {
+	Pattern       string
+	Anchored      bool
+	DirectoryOnly bool
 }
 
 type FileInfo struct {
@@ -40,12 +53,19 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ignoreMatcher, err := loadIgnoreMatcher(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/manifest", auth(config, handleManifest(config)))
-	mux.HandleFunc("/download/", auth(config, handleDownload(config)))
+	mux.HandleFunc("/manifest", auth(config, handleManifest(config, ignoreMatcher)))
+	mux.HandleFunc("/download/", auth(config, handleDownload(config, ignoreMatcher)))
 
 	log.Println("server started on", config.Addr)
 	log.Println("root:", config.Root)
+	log.Println("ignore file:", config.IgnoreFile)
+	log.Println("ignore rules:", len(ignoreMatcher.rules))
 
 	log.Fatal(http.ListenAndServe(config.Addr, mux))
 }
@@ -75,8 +95,134 @@ func loadConfig(path string) (Config, error) {
 	if config.Token == "" {
 		return Config{}, fmt.Errorf("token is required")
 	}
+	if config.IgnoreFile == "" {
+		config.IgnoreFile = ".serverignore"
+	}
 
 	return config, nil
+}
+
+func loadIgnoreMatcher(config Config) (IgnoreMatcher, error) {
+	ignorePath := config.IgnoreFile
+	if !filepath.IsAbs(ignorePath) {
+		ignorePath = filepath.Join(config.Root, ignorePath)
+	}
+
+	file, err := os.Open(ignorePath)
+	if os.IsNotExist(err) {
+		return IgnoreMatcher{}, nil
+	}
+	if err != nil {
+		return IgnoreMatcher{}, err
+	}
+	defer file.Close()
+
+	var rules []IgnoreRule
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		rule, ok := parseIgnoreRule(scanner.Text())
+		if ok {
+			rules = append(rules, rule)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return IgnoreMatcher{}, err
+	}
+
+	return IgnoreMatcher{rules: rules}, nil
+}
+
+func parseIgnoreRule(line string) (IgnoreRule, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return IgnoreRule{}, false
+	}
+
+	line = filepath.ToSlash(line)
+
+	anchored := strings.HasPrefix(line, "/")
+	line = strings.TrimPrefix(line, "/")
+
+	directoryOnly := strings.HasSuffix(line, "/")
+	line = strings.TrimSuffix(line, "/")
+	line = strings.TrimPrefix(line, "./")
+
+	if line == "" {
+		return IgnoreRule{}, false
+	}
+
+	return IgnoreRule{
+		Pattern:       line,
+		Anchored:      anchored,
+		DirectoryOnly: directoryOnly,
+	}, true
+}
+
+func (matcher IgnoreMatcher) Match(relPath string, isDir bool) bool {
+	relPath = cleanRelPath(relPath)
+	if relPath == "." {
+		return false
+	}
+
+	for _, rule := range matcher.rules {
+		if rule.Match(relPath, isDir) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rule IgnoreRule) Match(relPath string, isDir bool) bool {
+	parts := strings.Split(relPath, "/")
+
+	if !strings.Contains(rule.Pattern, "/") {
+		end := len(parts)
+		if rule.Anchored {
+			end = 1
+		}
+
+		for i, part := range parts[:end] {
+			matched, err := pathpkg.Match(rule.Pattern, part)
+			if err == nil && matched {
+				partIsDir := i < len(parts)-1 || isDir
+				if !rule.DirectoryOnly || partIsDir {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	start := 0
+	end := 1
+	if !rule.Anchored {
+		end = len(parts)
+	}
+
+	for i := start; i < end; i++ {
+		for j := i; j < len(parts); j++ {
+			candidate := strings.Join(parts[i:j+1], "/")
+			matched, err := pathpkg.Match(rule.Pattern, candidate)
+			if err == nil && matched {
+				candidateIsDir := j < len(parts)-1 || isDir
+				if !rule.DirectoryOnly || candidateIsDir {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func cleanRelPath(path string) string {
+	path = filepath.ToSlash(filepath.Clean(path))
+	path = strings.TrimPrefix(path, "./")
+	return path
 }
 
 func auth(config Config, next http.HandlerFunc) http.HandlerFunc {
@@ -89,7 +235,7 @@ func auth(config Config, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func handleManifest(config Config) http.HandlerFunc {
+func handleManifest(config Config, ignoreMatcher IgnoreMatcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var files []FileInfo
 
@@ -98,16 +244,24 @@ func handleManifest(config Config) http.HandlerFunc {
 				return err
 			}
 
-			if d.IsDir() {
-				return nil
-			}
-
 			rel, err := filepath.Rel(config.Root, path)
 			if err != nil {
 				return err
 			}
 
-			rel = filepath.ToSlash(rel)
+			rel = cleanRelPath(rel)
+
+			if ignoreMatcher.Match(rel, d.IsDir()) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+
+				return nil
+			}
+
+			if d.IsDir() {
+				return nil
+			}
 
 			info, err := d.Info()
 			if err != nil {
@@ -139,7 +293,7 @@ func handleManifest(config Config) http.HandlerFunc {
 	}
 }
 
-func handleDownload(config Config) http.HandlerFunc {
+func handleDownload(config Config, ignoreMatcher IgnoreMatcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/download/")
 		name = filepath.Clean(name)
@@ -150,6 +304,17 @@ func handleDownload(config Config) http.HandlerFunc {
 		}
 
 		fullPath := filepath.Join(config.Root, name)
+
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		if ignoreMatcher.Match(name, info.IsDir()) {
+			http.NotFound(w, r)
+			return
+		}
 
 		http.ServeFile(w, r, fullPath)
 	}

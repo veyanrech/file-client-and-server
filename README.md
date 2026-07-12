@@ -10,8 +10,23 @@ Server config: `server/config.json`
 {
   "addr": ":8881",
   "root": "./server_files",
-  "token": "secret-token"
+  "token": "secret-token",
+  "ignore_file": ".serverignore"
 }
+```
+
+`ignore_file` is resolved relative to `root` when it is not absolute. If the
+file does not exist, the server runs without ignore rules. Ignored files are not
+included in `/manifest` and cannot be downloaded through `/download/{path}`.
+
+Example `.serverignore`:
+
+```gitignore
+.git/
+.env
+node_modules/
+*.log
+tmp/
 ```
 
 Client config: `client/config.json`

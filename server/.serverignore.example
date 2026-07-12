@@ -1,0 +1,8 @@
+# Lines work similarly to .gitignore.
+# Put the real ignore file in the server root directory from config.json.
+
+.git/
+.env
+node_modules/
+*.log
+tmp/
